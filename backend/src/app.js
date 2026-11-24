@@ -1,0 +1,48 @@
+import express from 'express';
+import { createAdminService } from './services/admin.js';
+import helmet from 'helmet';
+import { randomUUID } from 'node:crypto';
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { createStore } from './store.js';
+import { createLibraryService } from './services/library.js';
+import { createJournalService } from './services/journal.js';
+import { createInsightsService } from './services/insights.js';
+import { createCatalogService } from './services/catalog.js';
+import { createCoverClient, signCoverUpload } from './services/covers.js';
+export function createApp({store=createStore(),local=process.env.LOCAL_DEV==='true', tokenVerifier, admin, catalog=createCatalogService()}={}){
+ if(local&&process.env.AWS_LAMBDA_FUNCTION_NAME)throw new Error('Local auth cannot run on Lambda');
+ const app=express(); app.disable('x-powered-by');app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:'32kb'}));
+ const verifier=!local?(tokenVerifier || CognitoJwtVerifier.create({userPoolId:process.env.USER_POOL_ID,tokenUse:'id',clientId:process.env.CLIENT_ID})):null;
+ admin ??= createAdminService({local});
+ const library=createLibraryService(store), journal=createJournalService(store,library), insights=createInsightsService(store,library);
+ app.use((req,res,next)=>{const origin=process.env.FRONTEND_ORIGIN;if(origin&&req.headers.origin===origin){res.set('Access-Control-Allow-Origin',origin);res.vary('Origin');res.set('Access-Control-Allow-Headers','Content-Type,Authorization');res.set('Access-Control-Allow-Methods','GET,POST,PUT,DELETE,OPTIONS');}if(req.method==='OPTIONS')return res.sendStatus(204);next();});
+ app.get('/api/health',(_req,res)=>res.json({ok:true}));
+ app.get('/api/public/:token',async(req,res)=>res.set('Cache-Control','no-store').json(await insights.publicList(req.params.token)));
+ app.use('/api',async(req,res,next)=>{try{const claims=local?{sub:'local-reader'}:await verifier.verify((req.headers.authorization||'').replace(/^Bearer /,''));req.user=claims.sub;req.username=claims['cognito:username']||claims.sub;req.adminCandidate=local||(Array.isArray(claims['cognito:groups'])&&claims['cognito:groups'].includes('administrators'));req.pk='USER#'+req.user;next();}catch{res.status(401).json({error:'Please sign in again'});}});
+ app.use('/api',(_req,res,next)=>{res.set('Cache-Control','no-store');next();});
+ app.get('/api/me',async(req,res)=>res.json({role:req.adminCandidate&&await admin.authorize(req.username)?'admin':'reader'}));
+ app.use('/api/admin',async(req,res,next)=>{if(!req.adminCandidate||!await admin.authorize(req.username))return res.status(403).json({error:'Administrator access required'});next();});
+ app.get('/api/admin/users',async(req,res)=>res.json(await admin.list(req.query.cursor)));
+ app.put('/api/admin/users/:username/access',async(req,res)=>res.json(await admin.setEnabled(req.username,req.params.username,req.body)));
+ async function find(req,_res){return library.requireBook(req.pk,req.params.id);}
+ app.get('/api/books',async(req,res)=>res.json(await library.list(req.pk)));
+ app.post('/api/books',async(req,res)=>res.status(201).json(await library.save(req.pk,req.body)));
+ app.put('/api/books/:id',async(req,res)=>res.json(await library.save(req.pk,req.body,req.params.id)));
+ app.delete('/api/books/:id',async(req,res)=>{await library.remove(req.pk,req.params.id);res.sendStatus(204);});
+ app.get('/api/books/:id/entries',async(req,res)=>res.json(await journal.list(req.pk,req.params.id)));
+ app.post('/api/books/:id/entries',async(req,res)=>res.status(201).json(await journal.add(req.pk,req.params.id,req.body)));
+ app.get('/api/books/:id/progress',async(req,res)=>res.json(await journal.getProgress(req.pk,req.params.id)));
+ app.put('/api/books/:id/progress',async(req,res)=>res.json(await journal.updateProgress(req.pk,req.params.id,req.body)));
+ app.delete('/api/books/:id/entries/:entryId',async(req,res)=>{await journal.remove(req.pk,req.params.id,req.params.entryId);res.sendStatus(204);});
+ app.get('/api/stats',async(req,res)=>res.json(await insights.stats(req.pk)));
+ app.post('/api/share',async(req,res)=>res.json(await insights.enableSharing(req.pk)));
+ app.delete('/api/share',async(req,res)=>{await insights.disableSharing(req.pk);res.sendStatus(204);});
+ app.get('/api/catalog',async(req,res)=>res.json(await catalog.search(req.query.q)));
+ const s3=createCoverClient();
+ app.post('/api/books/:id/cover',async(req,res)=>{if(!await find(req,res))return;if(!process.env.COVERS_BUCKET)return res.status(503).json({error:'Cover uploads require the AWS deployment'});const {contentType,size}=req.body;if(!['image/jpeg','image/png','image/webp'].includes(contentType)||!Number.isInteger(size)||size<1||size>5*1024*1024)return res.status(400).json({error:'Use a JPG, PNG or WebP under 5 MB'});const key=`covers/${req.user}/${req.params.id}/${randomUUID()}`;res.json({key,url:await signCoverUpload(s3,{bucket:process.env.COVERS_BUCKET,key,contentType,size})});});
+ app.get('/api/books/:id/cover',async(req,res)=>{const book=await find(req,res);if(!book)return;if(!book.coverKey||!process.env.COVERS_BUCKET)return res.status(404).json({error:'No cover'});res.json({url:await getSignedUrl(s3,new GetObjectCommand({Bucket:process.env.COVERS_BUCKET,Key:book.coverKey}),{expiresIn:300})});});
+ app.use('/api',(_req,res)=>res.status(404).json({error:'Endpoint not found'}));
+ app.use((err,_req,res,_next)=>{if(err.name==='ZodError')return res.status(400).json({error:err.issues.map(i=>i.message).join('; ')});const status=err.status||500;if(status>=500)console.error({status,message:'Request failed'});res.status(status).json({error:status>=500&&status!==502?'Unexpected server error':err.message});});return app;
+}
