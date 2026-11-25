@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Margin SES domain identity; deploy and verify DNS before enabling Cognito SES sending.
+Parameters:
+  EmailDomain:
+    Type: String
+    Description: Domain you control for the sender address (no scheme or email local part).
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+Resources:
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EmailIdentity: !Ref EmailDomain
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      FeedbackAttributes:
+        EmailForwardingEnabled: true
+Outputs:
+  IdentityArn:
+    Value: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${EmailDomain}'
+  DkimRecordName1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName1
+  DkimRecordValue1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue1
+  DkimRecordName2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName2
+  DkimRecordValue2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue2
+  DkimRecordName3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName3
+  DkimRecordValue3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue3

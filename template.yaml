@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Margin reading library - native frontend, Express Lambda, Cognito and DynamoDB
+Parameters:
+  SesIdentityArn:
+    Type: String
+    Default: ''
+    Description: ARN of an already verified SES identity; leave empty to retain Cognito email.
+    AllowedPattern: '^$|^arn:aws:ses:us-east-1:[0-9]{12}:identity/[^ ]+$'
+  SesFromAddress:
+    Type: String
+    Default: ''
+    Description: Verified sender, optionally with display name (for example Margin <noreply@example.com>).
+Rules:
+  RequireSesFromAddress:
+    RuleCondition: !Not [!Equals [!Ref SesIdentityArn, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SesFromAddress, '']]
+        AssertDescription: SesFromAddress is required when enabling SES.
+  RequireSesIdentity:
+    RuleCondition: !Not [!Equals [!Ref SesFromAddress, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SesIdentityArn, '']]
+        AssertDescription: SesIdentityArn is required when supplying a custom sender.
+Conditions:
+  UseSesEmail: !Not [!Equals [!Ref SesIdentityArn, '']]
+Resources:
+  LibraryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+  WebBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  CoversBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Sub 'https://${Distribution.DomainName}'
+            AllowedMethods: [PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 300
+  OriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-web'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-headers'
+        SecurityHeadersConfig:
+          ContentTypeOptions: {Override: true}
+          FrameOptions: {FrameOption: DENY, Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          StrictTransportSecurity: {AccessControlMaxAgeSec: 31536000, IncludeSubdomains: true, Override: true}
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://*.amazonaws.com; connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com https://cognito-idp.${AWS::Region}.amazonaws.com https://*.s3.${AWS::Region}.amazonaws.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${WebBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EmailConfiguration: !If
+        - UseSesEmail
+        - EmailSendingAccount: DEVELOPER
+          SourceArn: !Ref SesIdentityArn
+          From: !Ref SesFromAddress
+        - EmailSendingAccount: COGNITO_DEFAULT
+      VerificationMessageTemplate: !If
+        - UseSesEmail
+        - DefaultEmailOption: CONFIRM_WITH_CODE
+          EmailSubject: 'Your Margin verification code'
+          EmailMessage: >-
+            <div style="font-family:Arial,sans-serif;color:#263d35;max-width:520px;margin:auto;padding:24px">
+            <h1 style="color:#174f3e">Margin</h1>
+            <h2>Your verification code</h2>
+            <p>Enter this code in Margin to complete your request:</p>
+            <p style="font-size:30px;font-weight:bold;letter-spacing:6px">{####}</p>
+            <p>Do not share this code. If you did not request it, you can ignore this email.</p>
+            <p>A little room for reading.</p></div>
+        - DefaultEmailOption: CONFIRM_WITH_CODE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration: {CaseSensitive: false}
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+  AdministratorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: administrators
+      Description: Margin account administrators
+      UserPoolId: !Ref UserPool
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      IdTokenValidity: 1
+      AccessTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits: {IdToken: hours, AccessToken: hours, RefreshToken: days}
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref AWS::StackName
+      StageName: prod
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowOrigin: !Sub "'https://${Distribution.DomainName}'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 40
+          ThrottlingRateLimit: 20
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: src/lambda.handler
+      CodeUri: backend/
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LibraryTable
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+          COVERS_BUCKET: !Ref CoversBucket
+          FRONTEND_ORIGIN: !Sub 'https://${Distribution.DomainName}'
+          LOCAL_DEV: 'false'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource: !GetAtt LibraryTable.Arn
+            - Effect: Allow
+              Action: [cognito-idp:ListUsers, cognito-idp:AdminGetUser, cognito-idp:AdminListGroupsForUser, cognito-idp:AdminEnableUser, cognito-idp:AdminDisableUser]
+              Resource: !GetAtt UserPool.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${CoversBucket.Arn}/covers/*'
+      Events:
+        PrivateRoutes:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /api/{proxy+}
+            Method: ANY
+        PublicList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /api/public/{token}
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /api/health
+            Method: GET
+            Auth: {Authorizer: NONE}
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApiFunction}'
+      RetentionInDays: 14
+  LambdaRecentEventsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${AWS::StackName}/lambda-recent-events'
+      LogGroupNames:
+        - !Ref ApiLogGroup
+      QueryString: |
+        fields @timestamp, @requestId, @message, @logStream
+        | sort @timestamp desc
+        | limit 100
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-operations-${AWS::Region}'
+      DashboardBody: !Sub |
+        {
+          "start": "-PT3H",
+          "periodOverride": "inherit",
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 3,
+              "properties": {
+                "markdown": "# Margin operations\nLambda log group: `${ApiLogGroup}` (14-day retention). Saved query: `${AWS::StackName}/lambda-recent-events`.\n\nThe API Gateway chart counts client errors, including authentication failures that never invoke Lambda. Use the log query for Lambda invocations and application diagnostics."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 3,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "title": "API Gateway 4XXError \u2014 prod (count per 5 minutes)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApiGateway",
+                    "4XXError",
+                    "ApiName",
+                    "${AWS::StackName}",
+                    "Stage",
+                    "prod"
+                  ]
+                ],
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "liveData": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 9,
+              "width": 24,
+              "height": 7,
+              "properties": {
+                "title": "Recent Lambda log events",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "query": "SOURCE '${ApiLogGroup}'\n| fields @timestamp, @requestId, @message, @logStream\n| sort @timestamp desc\n| limit 100"
+              }
+            }
+          ]
+        }
+Outputs:
+  WebsiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  ApiUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  FrontendBucket:
+    Value: !Ref WebBucket
+  DistributionId:
+    Value: !Ref Distribution
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CoversBucketName:
+    Value: !Ref CoversBucket
+  TableName:
+    Value: !Ref LibraryTable
+  LambdaLogGroupName:
+    Value: !Ref ApiLogGroup
+  LambdaLogsQueryId:
+    Value: !Ref LambdaRecentEventsQuery
+  CloudWatchDashboardName:
+    Value: !Ref OperationsDashboard
+  CloudWatchDashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${OperationsDashboard}'
+  ApiMetricName:
+    Description: API name used by the CloudWatch ApiName dimension.
+    Value: !Ref AWS::StackName
